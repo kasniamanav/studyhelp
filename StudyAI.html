@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>StudyAI</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+:root{--bg:#f7f7fb;--card:#fff;--pri:#4f46e5;--prid:#4338ca;--txt:#1e1b2e;--mut:#6b7280;--bd:#e6e6f0}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0e0e16;--card:#181822;--txt:#eaeaf5;--mut:#9a9ab0;--bd:#2a2a38}}
+:root[data-theme="dark"]{--bg:#0e0e16;--card:#181822;--txt:#eaeaf5;--mut:#9a9ab0;--bd:#2a2a38}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{background:var(--bg);color:var(--txt);margin:0;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px}
+.btn{background:var(--pri);color:#fff;border-radius:10px;padding:.55rem 1rem;font-weight:600}
+.btn:hover{background:var(--prid)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-o{border:1px solid var(--bd);border-radius:10px;padding:.5rem 1rem;font-weight:500}
+input,textarea,select{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.55rem .75rem;color:var(--txt);width:100%}
+.nav-link{display:flex;gap:.6rem;align-items:center;padding:.6rem .9rem;border-radius:10px;color:var(--mut);font-weight:500;cursor:pointer}
+.nav-link:hover{background:var(--bd)}
+.nav-link.active{background:var(--pri);color:#fff}
+.badge{font-size:.65rem;background:var(--bd);color:var(--mut);border-radius:6px;padding:.1rem .4rem}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:6px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toastbox" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2"></div>
+<script>
+let sampleFn=null, db=null, uid=null, matCol=null, quizCol=null;
+let materials=[], quizResults=[];
+let section='dashboard';
+let selMaterial=null, freeTopic='', explainLevel='simple';
+let explainData=null, explainLoading=false, explainErr=null;
+let chatTurns=[], chatLoading=false;
+let quizDifficulty='medium', quizCount=5;
+let quizQs=null, quizAnswers={}, quizSubmitted=false, quizLoading=false, quizErr=null;
+let mockDifficulty='medium', mockCount=10, mockMinutes=20;
+let mockQs=null, mockAnswers={}, mockMarked=null, mockIndex=0, mockSubmitted=false, mockLoading=false, mockErr=null, mockTimeLeft=0, mockDuration=0, mockTimerId=null;
+let flashCount=12, flashCards=null, flashIndex=0, flashFlipped=false, flashDifficult=null, flashLoading=false, flashErr=null;
+
+function toast(msg,ok=true){
+  const box=document.getElementById('toastbox');
+  const el=document.createElement('div');
+  el.className='card px-4 py-2 text-sm shadow-lg'+(ok?'':' text-red-500');
+  el.textContent=msg;
+  box.appendChild(el);
+  setTimeout(()=>el.remove(),3500);
+}
+
+function aiErrorMsg(e){
+  const map={
+    not_granted:'AI access was declined — reload the page and allow AI access when prompted.',
+    rate_limited:'Too many requests right now — wait a moment and try again.',
+    sampling_disabled:'AI is not available for this account.',
+    prompt_too_large:'That material is too long — try a shorter excerpt.',
+    invalid_json:'The AI response could not be read — try again.',
+    refused:'The AI declined that request — try rephrasing.',
+    empty_completion:'The AI did not return anything — try again.'
+  };
+  return (e&&map[e.code]) || 'Something went wrong. Try again.';
+}
+async function callJsonWithRetry(prompt,opts,validate){
+  for(let attempt=0;attempt<2;attempt++){
+    try{
+      const data=await sampleFn.json(prompt,opts);
+      if(!validate||validate(data)) return {data};
+      if(attempt===1) return {error:{code:'invalid_json'}};
+    }catch(e){
+      if(attempt===1||e.code!=='invalid_json') return {error:e};
+    }
+  }
+  return {error:{code:'invalid_json'}};
+}
+
+async function init(){
+  try{
+    sampleFn = await claude.use('sample');
+    db = await claude.use('db');
+    const user = await claude.use('user');
+    uid = user ? await user.id() : null;
+    if(db && uid){
+      const root = db.doc('data/users/'+uid+'/profile');
+      matCol = root.collection('materials');
+      quizCol = root.collection('quizzes');
+      await loadData();
+    }
+  }catch(e){}
+  render();
+}
+async function loadData(){
+  try{ const m=await matCol.orderBy('createdAt','desc').limit(20).get(); materials=m.docs.map(d=>({id:d.id,...d.data()})); }catch(e){ materials=[]; }
+  try{ const q=await quizCol.orderBy('createdAt','desc').limit(30).get(); quizResults=q.docs.map(d=>({id:d.id,...d.data()})); }catch(e){ quizResults=[]; }
+}
+
+function activeText(){
+  if(selMaterial){ const m=materials.find(x=>x.id===selMaterial); if(m) return {topic:m.title, content:m.content||''}; }
+  return {topic:freeTopic, content:''};
+}
+
+async function generateExplanation(){
+  const {topic,content}=activeText();
+  if(!topic.trim()){ toast('Enter a topic or pick a material first',false); return; }
+  if(!sampleFn){ explainErr='AI is not available in this view.'; render(); return; }
+  explainLoading=true; explainErr=null; explainData=null; render();
+  const levelDesc={beginner:'a total beginner, very simple language',simple:'a simple, clear explanation',detailed:'a detailed, thorough explanation',exam:'exam-focused, highlighting what is likely to be tested'}[explainLevel];
+  const prompt='You are an academic tutor. Topic: "'+topic+'".'+(content?'\nStudy material from the student:\n"""'+content.slice(0,6000)+'"""\nBase your explanation primarily on this material.':'')+
+  '\nWrite '+levelDesc+'.\nReply with ONLY a JSON object, no prose outside it, matching exactly:\n{"overview":"string","keyPoints":["string"],"examples":["string"],"definitions":[{"term":"string","definition":"string"}],"commonMistakes":["string"],"examTips":["string"],"quickRevision":["string"]}';
+  const {data,error}=await callJsonWithRetry(prompt,{modelTier:'default'}, d=>d&&typeof d==='object'&&!Array.isArray(d)&&d.overview);
+  explainLoading=false;
+  if(error){ explainErr=aiErrorMsg(error); render(); return; }
+  explainData=data;
+  chatTurns=[{role:'user',content:'(Context) Topic: '+topic+'. '+(content?('Notes: '+content.slice(0,4000)):'')+'\n\nYou are a tutor answering short follow-up questions about this topic.'},{role:'assistant',content:'Ready to help with follow-up questions about '+topic+'.'}];
+  render();
+}
+
+async function askFollowup(q){
+  if(!q.trim()||!sampleFn) return;
+  chatTurns.push({role:'user',content:q});
+  chatLoading=true; render();
+  try{ const {text}=await sampleFn(chatTurns,{cache:false,modelTier:'default'}); chatTurns.push({role:'assistant',content:text}); }
+  catch(e){ chatTurns.push({role:'assistant',content:aiErrorMsg(e)}); }
+  chatLoading=false; render();
+}
+
+function validQ(q){ return !!(q&&q.question&&Array.isArray(q.options)&&q.options.length>=2&&typeof q.correctAnswer==='number'&&q.correctAnswer>=0&&q.correctAnswer<q.options.length); }
+function quizPrompt(topic,content,count,difficulty){
+  return 'Create '+count+' multiple-choice questions at '+difficulty+' difficulty about: "'+topic+'".'+(content?'\nBase them on this material:\n"""'+content.slice(0,6000)+'"""':'')+
+  '\nReply with ONLY a JSON array, no prose, of exactly '+count+' items shaped like:\n{"question":"string","options":["a","b","c","d"],"correctAnswer":0,"explanation":"string"}\ncorrectAnswer is the 0-based index of the right option.';
+}
+
+async function generateQuiz(){
+  const {topic,content}=activeText();
+  if(!topic.trim()){ toast('Enter a topic or pick a material first',false); return; }
+  if(!sampleFn){ quizErr='AI is not available in this view.'; render(); return; }
+  quizLoading=true; quizErr=null; quizQs=null; quizAnswers={}; quizSubmitted=false; render();
+  const {data,error}=await callJsonWithRetry(quizPrompt(topic,content,quizCount,quizDifficulty),{modelTier:'default'}, d=>Array.isArray(d)&&d.filter(validQ).length>0);
+  quizLoading=false;
+  if(error){ quizErr=aiErrorMsg(error); render(); return; }
+  const qs=data.filter(validQ);
+  if(!qs.length){ quizErr='Could not generate a valid quiz. Please try again.'; render(); return; }
+  quizQs=qs; render();
+}
+
+async function submitQuiz(){
+  let score=0; quizQs.forEach((q,i)=>{ if(quizAnswers[i]===q.correctAnswer) score++; });
+  quizSubmitted=true; render();
+  if(quizCol){ try{ await quizCol.add({topic:activeText().topic,difficulty:quizDifficulty,score,total:quizQs.length,type:'quiz',createdAt:Date.now()}); await loadData(); }catch(e){} }
+}
+
+async function saveMaterial(title,subject,topic,content){
+  if(!title.trim()){ toast('Give it a title',false); return; }
+  if(matCol){
+    try{ await matCol.add({title,subject,topic,content,createdAt:Date.now()}); await loadData(); toast('Saved'); }
+    catch(e){ toast('Could not save (need edit access)',false); }
+  } else { materials.unshift({id:'local'+Date.now(),title,subject,topic,content,createdAt:Date.now()}); toast('Saved for this session'); }
+  render();
+}
+async function deleteMaterial(id){
+  if(matCol){ try{ await matCol.doc(id).delete(); await loadData(); }catch(e){} }
+  else materials=materials.filter(m=>m.id!==id);
+  if(selMaterial===id) selMaterial=null;
+  render();
+}
+
+function fmtTime(s){ s=Math.max(0,s); const m=Math.floor(s/60), sec=s%60; return (m<10?'0':'')+m+':'+(sec<10?'0':'')+sec; }
+async function generateMock(){
+  const {topic,content}=activeText();
+  if(!topic.trim()){ toast('Enter a topic or pick a material first',false); return; }
+  if(!sampleFn){ mockErr='AI is not available in this view.'; render(); return; }
+  mockLoading=true; mockErr=null; mockQs=null; render();
+  const {data,error}=await callJsonWithRetry(quizPrompt(topic,content,mockCount,mockDifficulty),{modelTier:'default'}, d=>Array.isArray(d)&&d.filter(validQ).length>0);
+  mockLoading=false;
+  if(error){ mockErr=aiErrorMsg(error); render(); return; }
+  const qs=data.filter(validQ);
+  if(!qs.length){ mockErr='Could not generate a valid mock test. Please try again.'; render(); return; }
+  mockQs=qs; mockAnswers={}; mockMarked=new Set(); mockIndex=0; mockSubmitted=false;
+  mockDuration=mockMinutes*60; mockTimeLeft=mockDuration;
+  render();
+  clearInterval(mockTimerId);
+  mockTimerId=setInterval(()=>{
+    mockTimeLeft--;
+    const el=document.getElementById('mock-timer');
+    if(el) el.textContent=fmtTime(mockTimeLeft);
+    if(mockTimeLeft<=0){ clearInterval(mockTimerId); submitMock(); }
+  },1000);
+}
+function mockGoto(i){ mockIndex=i; render(); }
+function mockToggleMark(){ if(mockMarked.has(mockIndex)) mockMarked.delete(mockIndex); else mockMarked.add(mockIndex); render(); }
+async function submitMock(){
+  clearInterval(mockTimerId);
+  mockSubmitted=true; render();
+  let score=0; mockQs.forEach((q,i)=>{ if(mockAnswers[i]===q.correctAnswer) score++; });
+  if(quizCol){ try{ await quizCol.add({topic:activeText().topic,difficulty:mockDifficulty,score,total:mockQs.length,type:'mock',timeTakenSec:mockDuration-mockTimeLeft,createdAt:Date.now()}); await loadData(); }catch(e){} }
+}
+
+async function generateFlash(){
+  const {topic,content}=activeText();
+  if(!topic.trim()){ toast('Enter a topic or pick a material first',false); return; }
+  if(!sampleFn){ flashErr='AI is not available in this view.'; render(); return; }
+  flashLoading=true; flashErr=null; flashCards=null; render();
+  const prompt='Create '+flashCount+' flashcards for studying: "'+topic+'".'+(content?'\nBase them on this material:\n"""'+content.slice(0,6000)+'"""':'')+
+  '\nReply with ONLY a JSON array of exactly '+flashCount+' items shaped like {"front":"term or question","back":"answer or explanation"}.';
+  const {data,error}=await callJsonWithRetry(prompt,{modelTier:'default'}, d=>Array.isArray(d)&&d.filter(c=>c&&c.front&&c.back).length>0);
+  flashLoading=false;
+  if(error){ flashErr=aiErrorMsg(error); render(); return; }
+  const cards=data.filter(c=>c&&c.front&&c.back);
+  if(!cards.length){ flashErr='Could not generate flashcards. Try again.'; render(); return; }
+  flashCards=cards; flashIndex=0; flashFlipped=false; flashDifficult=new Set();
+  render();
+}
+function flashNext(){ flashFlipped=false; flashIndex=(flashIndex+1)%flashCards.length; render(); }
+function flashPrev(){ flashFlipped=false; flashIndex=(flashIndex-1+flashCards.length)%flashCards.length; render(); }
+function flashShuffle(){ for(let i=flashCards.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); const t=flashCards[i]; flashCards[i]=flashCards[j]; flashCards[j]=t; } flashIndex=0; flashFlipped=false; render(); }
+function flashToggleDifficult(){ if(flashDifficult.has(flashIndex)) flashDifficult.delete(flashIndex); else flashDifficult.add(flashIndex); render(); }
+function flashFlip(){ flashFlipped=!flashFlipped; render(); }
+
+function icon(k){ return {dash:'⌂',mat:'📄',exp:'💡',quiz:'📝',mock:'⏱',flash:'🗂',pres:'📊',chat:'💬',set:'⚙'}[k]||'•'; }
+const NAV=[['dashboard','dash','Dashboard',true],['materials','mat','Study Materials',true],['explainer','exp','AI Explainer',true],['quiz','quiz','Quiz',true],['mock','mock','Mock Tests',true],['flash','flash','Flashcards',true],['pres','pres','Presentation',false],['chat','chat','AI Chat',false],['settings','set','Settings',false]];
+function setSection(s,en){ if(!en){ toast('Coming in the next build',false); return; } section=s; render(); }
+
+function render(){
+  const app=document.getElementById('app');
+  app.innerHTML=
+  '<div class="flex min-h-screen">'+
+    '<aside class="hidden md:flex flex-col w-60 shrink-0 border-r p-4 gap-1" style="border-color:var(--bd)">'+
+      '<div class="text-xl font-bold mb-4" style="color:var(--pri)">StudyAI</div>'+
+      NAV.map(([id,ic,label,en])=>'<div class="nav-link '+(section===id?'active':'')+'" onclick="setSection(\''+id+'\','+en+')"><span>'+icon(ic)+'</span>'+label+' '+(!en?'<span class="badge ml-auto">soon</span>':'')+'</div>').join('')+
+    '</aside>'+
+    '<main class="flex-1 p-4 md:p-8 max-w-4xl mx-auto w-full">'+
+      '<div class="md:hidden flex flex-wrap gap-2 mb-4">'+NAV.map(([id,ic,label,en])=>'<button class="btn-o text-xs '+(section===id?'!bg-indigo-600 !text-white':'')+'" onclick="setSection(\''+id+'\','+en+')">'+label+'</button>').join('')+'</div>'+
+      (section==='dashboard'?renderDashboard():'')+
+      (section==='materials'?renderMaterials():'')+
+      (section==='explainer'?renderExplainer():'')+
+      (section==='quiz'?renderQuiz():'')+
+      (section==='mock'?renderMock():'')+
+      (section==='flash'?renderFlash():'')+
+    '</main>'+
+  '</div>';
+}
+
+function renderDashboard(){
+  const avg=quizResults.length?Math.round(quizResults.reduce((a,q)=>a+(q.score/q.total*100),0)/quizResults.length):0;
+  return '<h1 class="text-2xl font-bold mb-1">Welcome back 👋</h1><p class="mb-6" style="color:var(--mut)">Your AI-powered study companion.</p>'+
+  '<div class="grid grid-cols-3 gap-3 mb-6"><div class="card p-4"><div class="text-2xl font-bold">'+materials.length+'</div><div class="text-xs" style="color:var(--mut)">Materials</div></div>'+
+  '<div class="card p-4"><div class="text-2xl font-bold">'+quizResults.length+'</div><div class="text-xs" style="color:var(--mut)">Quizzes/tests taken</div></div>'+
+  '<div class="card p-4"><div class="text-2xl font-bold">'+avg+'%</div><div class="text-xs" style="color:var(--mut)">Avg score</div></div></div>'+
+  '<div class="flex gap-2 flex-wrap mb-6"><button class="btn" onclick="setSection(\'materials\',true)">+ Add study material</button><button class="btn-o" onclick="setSection(\'quiz\',true)">Generate quiz</button><button class="btn-o" onclick="setSection(\'mock\',true)">Mock test</button><button class="btn-o" onclick="setSection(\'flash\',true)">Flashcards</button></div>'+
+  '<h2 class="font-semibold mb-2">Recent materials</h2>'+
+  (materials.length?materials.slice(0,5).map(m=>'<div class="card p-3 mb-2 flex justify-between items-center"><div><div class="font-medium">'+esc(m.title)+'</div><div class="text-xs" style="color:var(--mut)">'+esc(m.subject||'')+'</div></div><button class="btn-o text-xs" onclick="selMaterial=\''+m.id+'\';setSection(\'explainer\',true)">Open</button></div>').join(''):'<p class="text-sm" style="color:var(--mut)">No materials yet — add one to get started.</p>');
+}
+
+function renderMaterials(){
+  return '<h1 class="text-2xl font-bold mb-4">Study Materials</h1>'+
+  '<div class="card p-4 mb-6"><div class="grid gap-3">'+
+  '<input id="m-title" placeholder="Title (e.g. Photosynthesis)">'+
+  '<div class="grid grid-cols-2 gap-3"><input id="m-subject" placeholder="Subject (optional)"><input id="m-topic" placeholder="Chapter/Topic (optional)"></div>'+
+  '<textarea id="m-content" rows="5" placeholder="Paste your notes here (optional — you can also just give a title/topic and generate from that)"></textarea>'+
+  '<div class="flex items-center gap-2 flex-wrap"><input type="file" id="m-file" accept=".txt" class="text-xs"><span class="text-xs" style="color:var(--mut)">.txt supported directly — for PDF/DOCX/PPTX, paste the text for now</span></div>'+
+  '<button class="btn w-fit" onclick="handleSaveMaterial()">Save material</button></div></div>'+
+  '<h2 class="font-semibold mb-2">Your materials</h2>'+
+  (materials.length?materials.map(m=>'<div class="card p-3 mb-2"><div class="flex justify-between items-start gap-2"><div><div class="font-medium">'+esc(m.title)+'</div><div class="text-xs" style="color:var(--mut)">'+esc(m.subject||'')+(m.topic?' · '+esc(m.topic):'')+'</div></div><button class="text-xs" style="color:#ef4444" onclick="deleteMaterial(\''+m.id+'\')">Delete</button></div><div class="flex gap-2 mt-2 flex-wrap"><button class="btn-o text-xs" onclick="selMaterial=\''+m.id+'\';setSection(\'explainer\',true)">Explain</button><button class="btn-o text-xs" onclick="selMaterial=\''+m.id+'\';setSection(\'quiz\',true)">Quiz me</button><button class="btn-o text-xs" onclick="selMaterial=\''+m.id+'\';setSection(\'flash\',true)">Flashcards</button></div></div>').join(''):'<p class="text-sm" style="color:var(--mut)">Nothing saved yet.</p>');
+}
+function handleSaveMaterial(){
+  const title=document.getElementById('m-title').value, subject=document.getElementById('m-subject').value, topic=document.getElementById('m-topic').value, content=document.getElementById('m-content').value;
+  const file=document.getElementById('m-file').files[0];
+  if(file){ const r=new FileReader(); r.onload=()=>saveMaterial(title||file.name,subject,topic,r.result); r.readAsText(file); }
+  else saveMaterial(title,subject,topic,content);
+}
+
+function renderExplainer(){
+  return '<h1 class="text-2xl font-bold mb-4">AI Explainer</h1>'+
+  '<div class="card p-4 mb-4 grid gap-3">'+
+  '<select onchange="selMaterial=this.value||null;render()"><option value="">— Free topic —</option>'+materials.map(m=>'<option value="'+m.id+'" '+(selMaterial===m.id?'selected':'')+'>'+esc(m.title)+'</option>').join('')+'</select>'+
+  (!selMaterial?'<input placeholder="Enter a topic, e.g. What is photosynthesis?" value="'+esc(freeTopic)+'" oninput="freeTopic=this.value">':'')+
+  '<div class="flex gap-2 flex-wrap">'+['beginner','simple','detailed','exam'].map(l=>'<button class="btn-o text-xs '+(explainLevel===l?'!bg-indigo-600 !text-white':'')+'" onclick="explainLevel=\''+l+'\';render()">'+l[0].toUpperCase()+l.slice(1)+'</button>').join('')+'</div>'+
+  '<button class="btn w-fit" '+(explainLoading?'disabled':'')+' onclick="generateExplanation()">'+(explainLoading?'Thinking…':'Explain')+'</button></div>'+
+  (explainErr?'<div class="card p-4 mb-4 text-red-500 text-sm">'+explainErr+' <button class="btn-o text-xs ml-2" onclick="generateExplanation()">Try again</button></div>':'')+
+  (explainData?renderExplainData(explainData):'')+
+  (explainData?renderChat():'');
+}
+function renderExplainData(d){
+  const sec=(t,items,r)=>items&&items.length?'<div class="mb-3"><div class="font-semibold text-sm mb-1">'+t+'</div>'+r(items)+'</div>':'';
+  const ul=a=>'<ul class="list-disc pl-5 text-sm space-y-1">'+a.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+  return '<div class="card p-4 mb-4"><p class="mb-3">'+esc(d.overview||'')+'</p>'+
+  sec('Key points',d.keyPoints,ul)+sec('Examples',d.examples,ul)+
+  (d.definitions&&d.definitions.length?'<div class="mb-3"><div class="font-semibold text-sm mb-1">Definitions</div><div class="text-sm space-y-1">'+d.definitions.map(x=>'<div><b>'+esc(x.term)+':</b> '+esc(x.definition)+'</div>').join('')+'</div></div>':'')+
+  sec('Common mistakes',d.commonMistakes,ul)+sec('Exam tips',d.examTips,ul)+sec('Quick revision',d.quickRevision,ul)+'</div>';
+}
+function renderChat(){
+  const msgs=chatTurns.slice(2);
+  return '<div class="card p-4 mb-4"><div class="font-semibold text-sm mb-2">Ask a follow-up</div>'+
+  '<div class="space-y-2 mb-2 max-h-64 overflow-y-auto">'+msgs.map(m=>'<div class="text-sm '+(m.role==='user'?'font-medium':'')+'">'+(m.role==='user'?'You: ':'AI: ')+esc(m.content)+'</div>').join('')+'</div>'+
+  '<div class="flex gap-2"><input id="chat-in" placeholder="e.g. Give me an example" '+(chatLoading?'disabled':'')+'><button class="btn-o" '+(chatLoading?'disabled':'')+' onclick="const v=document.getElementById(\'chat-in\').value;document.getElementById(\'chat-in\').value=\'\';askFollowup(v)">'+(chatLoading?'…':'Send')+'</button></div></div>';
+}
+
+function renderQuiz(){
+  if(quizQs && !quizSubmitted) return renderQuizTake();
+  if(quizQs && quizSubmitted) return renderQuizResult();
+  return '<h1 class="text-2xl font-bold mb-4">Quiz Generator</h1>'+
+  '<div class="card p-4 mb-4 grid gap-3">'+
+  '<select onchange="selMaterial=this.value||null;render()"><option value="">— Free topic —</option>'+materials.map(m=>'<option value="'+m.id+'" '+(selMaterial===m.id?'selected':'')+'>'+esc(m.title)+'</option>').join('')+'</select>'+
+  (!selMaterial?'<input placeholder="Topic, e.g. Cell division" value="'+esc(freeTopic)+'" oninput="freeTopic=this.value">':'')+
+  '<div class="grid grid-cols-2 gap-3"><select onchange="quizDifficulty=this.value">'+['easy','medium','hard'].map(d=>'<option value="'+d+'" '+(quizDifficulty===d?'selected':'')+'>'+d[0].toUpperCase()+d.slice(1)+'</option>').join('')+'</select>'+
+  '<select onchange="quizCount=+this.value">'+[5,10,20].map(n=>'<option value="'+n+'" '+(quizCount===n?'selected':'')+'>'+n+' questions</option>').join('')+'</select></div>'+
+  '<button class="btn w-fit" '+(quizLoading?'disabled':'')+' onclick="generateQuiz()">'+(quizLoading?'Generating…':'Generate quiz')+'</button></div>'+
+  (quizErr?'<div class="card p-4 text-red-500 text-sm">'+quizErr+' <button class="btn-o text-xs ml-2" onclick="generateQuiz()">Try again</button></div>':'')+
+  (quizResults.length?'<h2 class="font-semibold mb-2 mt-6">Past results</h2>'+quizResults.slice(0,5).map(q=>'<div class="card p-3 mb-2 flex justify-between"><span>'+esc(q.topic)+' ('+q.difficulty+(q.type==='mock'?', mock':'')+')</span><span class="font-medium">'+q.score+'/'+q.total+'</span></div>').join(''):'');
+}
+function renderQuizTake(){
+  return '<h1 class="text-2xl font-bold mb-4">Quiz</h1>'+
+  quizQs.map((q,i)=>'<div class="card p-4 mb-3"><div class="font-medium mb-2">'+(i+1)+'. '+esc(q.question)+'</div>'+
+    q.options.map((o,j)=>'<label class="flex items-center gap-2 text-sm mb-1 cursor-pointer"><input type="radio" name="q'+i+'" '+(quizAnswers[i]===j?'checked':'')+' onchange="quizAnswers['+i+']='+j+'"> '+esc(o)+'</label>').join('')+'</div>').join('')+
+  '<button class="btn" onclick="submitQuiz()">Submit quiz</button>';
+}
+function renderQuizResult(){
+  let score=0; quizQs.forEach((q,i)=>{if(quizAnswers[i]===q.correctAnswer)score++;});
+  const pct=Math.round(score/quizQs.length*100);
+  return '<h1 class="text-2xl font-bold mb-1">Results</h1><p class="mb-4" style="color:var(--mut)">'+score+'/'+quizQs.length+' correct ('+pct+'%)</p>'+
+  quizQs.map((q,i)=>{const ok=quizAnswers[i]===q.correctAnswer; return '<div class="card p-4 mb-3"><div class="font-medium mb-1">'+(i+1)+'. '+esc(q.question)+' <span class="text-xs '+(ok?'text-green-600':'text-red-500')+'">'+(ok?'Correct':'Incorrect')+'</span></div>'+
+  '<div class="text-sm mb-1">Your answer: '+esc(q.options[quizAnswers[i]]??'—')+(!ok?' · Correct: '+esc(q.options[q.correctAnswer]):'')+'</div>'+
+  '<div class="text-xs" style="color:var(--mut)">'+esc(q.explanation||'')+'</div></div>';}).join('')+
+  '<button class="btn" onclick="quizQs=null;quizSubmitted=false;render()">Retry / new quiz</button>';
+}
+
+function renderMock(){
+  if(mockQs && !mockSubmitted) return renderMockTake();
+  if(mockQs && mockSubmitted) return renderMockResult();
+  return '<h1 class="text-2xl font-bold mb-4">Mock Test</h1>'+
+  '<div class="card p-4 mb-4 grid gap-3">'+
+  '<select onchange="selMaterial=this.value||null;render()"><option value="">— Free topic —</option>'+materials.map(m=>'<option value="'+m.id+'" '+(selMaterial===m.id?'selected':'')+'>'+esc(m.title)+'</option>').join('')+'</select>'+
+  (!selMaterial?'<input placeholder="Subject/topic, e.g. Organic chemistry" value="'+esc(freeTopic)+'" oninput="freeTopic=this.value">':'')+
+  '<div class="grid grid-cols-3 gap-3">'+
+  '<select onchange="mockDifficulty=this.value">'+['easy','medium','hard'].map(d=>'<option value="'+d+'" '+(mockDifficulty===d?'selected':'')+'>'+d[0].toUpperCase()+d.slice(1)+'</option>').join('')+'</select>'+
+  '<select onchange="mockCount=+this.value">'+[10,20,30].map(n=>'<option value="'+n+'" '+(mockCount===n?'selected':'')+'>'+n+' questions</option>').join('')+'</select>'+
+  '<select onchange="mockMinutes=+this.value">'+[10,20,30,60].map(n=>'<option value="'+n+'" '+(mockMinutes===n?'selected':'')+'>'+n+' min</option>').join('')+'</select>'+
+  '</div>'+
+  '<button class="btn w-fit" '+(mockLoading?'disabled':'')+' onclick="generateMock()">'+(mockLoading?'Preparing…':'Start mock test')+'</button></div>'+
+  (mockErr?'<div class="card p-4 text-red-500 text-sm">'+mockErr+' <button class="btn-o text-xs ml-2" onclick="generateMock()">Try again</button></div>':'');
+}
+function renderMockTake(){
+  const q=mockQs[mockIndex];
+  const nav=mockQs.map((_,i)=>{
+    const st=mockAnswers[i]!==undefined?(mockMarked.has(i)?'bg-amber-400 text-white':'bg-indigo-600 text-white'):(mockMarked.has(i)?'bg-amber-100':'');
+    return '<button class="btn-o text-xs w-8 h-8 p-0 '+st+' '+(i===mockIndex?'ring-2 ring-indigo-400':'')+'" onclick="mockGoto('+i+')">'+(i+1)+'</button>';
+  }).join('');
+  return '<div class="flex justify-between items-center mb-3"><h1 class="text-2xl font-bold">Mock Test</h1><div class="card px-3 py-1 font-mono" id="mock-timer">'+fmtTime(mockTimeLeft)+'</div></div>'+
+  '<div class="flex flex-wrap gap-1 mb-4">'+nav+'</div>'+
+  '<div class="card p-4 mb-4"><div class="text-xs mb-2" style="color:var(--mut)">Question '+(mockIndex+1)+' of '+mockQs.length+'</div><div class="font-medium mb-3">'+esc(q.question)+'</div>'+
+  q.options.map((o,j)=>'<label class="flex items-center gap-2 text-sm mb-2 cursor-pointer"><input type="radio" name="mq" '+(mockAnswers[mockIndex]===j?'checked':'')+' onchange="mockAnswers['+mockIndex+']='+j+'"> '+esc(o)+'</label>').join('')+
+  '</div>'+
+  '<div class="flex flex-wrap gap-2">'+
+  '<button class="btn-o" onclick="mockGoto('+Math.max(0,mockIndex-1)+')" '+(mockIndex===0?'disabled':'')+'>← Previous</button>'+
+  '<button class="btn-o" onclick="mockGoto('+Math.min(mockQs.length-1,mockIndex+1)+')" '+(mockIndex===mockQs.length-1?'disabled':'')+'>Next →</button>'+
+  '<button class="btn-o" onclick="mockToggleMark()">'+(mockMarked.has(mockIndex)?'Unmark':'Mark for review')+'</button>'+
+  '<button class="btn ml-auto" onclick="submitMock()">Submit test</button>'+
+  '</div>';
+}
+function renderMockResult(){
+  let score=0,unattempted=0; mockQs.forEach((q,i)=>{ if(mockAnswers[i]===undefined) unattempted++; else if(mockAnswers[i]===q.correctAnswer) score++; });
+  const wrong=mockQs.length-score-unattempted, pct=Math.round(score/mockQs.length*100), timeTaken=mockDuration-mockTimeLeft;
+  return '<h1 class="text-2xl font-bold mb-1">Mock Test Results</h1>'+
+  '<div class="grid grid-cols-4 gap-3 mb-4">'+
+  '<div class="card p-3 text-center"><div class="text-xl font-bold">'+pct+'%</div><div class="text-xs" style="color:var(--mut)">Score</div></div>'+
+  '<div class="card p-3 text-center"><div class="text-xl font-bold text-green-600">'+score+'</div><div class="text-xs" style="color:var(--mut)">Correct</div></div>'+
+  '<div class="card p-3 text-center"><div class="text-xl font-bold text-red-500">'+wrong+'</div><div class="text-xs" style="color:var(--mut)">Wrong</div></div>'+
+  '<div class="card p-3 text-center"><div class="text-xl font-bold">'+unattempted+'</div><div class="text-xs" style="color:var(--mut)">Skipped</div></div></div>'+
+  '<p class="text-sm mb-4" style="color:var(--mut)">Time taken: '+fmtTime(timeTaken)+'</p>'+
+  mockQs.map((q,i)=>{const ans=mockAnswers[i]; const ok=ans===q.correctAnswer; return '<div class="card p-4 mb-3"><div class="font-medium mb-1">'+(i+1)+'. '+esc(q.question)+' <span class="text-xs '+(ans===undefined?'text-gray-400':ok?'text-green-600':'text-red-500')+'">'+(ans===undefined?'Not attempted':ok?'Correct':'Incorrect')+'</span></div>'+
+  '<div class="text-sm mb-1">'+(ans!==undefined?'Your answer: '+esc(q.options[ans]):'')+(!ok?' · Correct: '+esc(q.options[q.correctAnswer]):'')+'</div>'+
+  '<div class="text-xs" style="color:var(--mut)">'+esc(q.explanation||'')+'</div></div>';}).join('')+
+  '<button class="btn" onclick="mockQs=null;mockSubmitted=false;render()">New mock test</button>';
+}
+
+function renderFlash(){
+  if(!flashCards) return '<h1 class="text-2xl font-bold mb-4">Flashcards</h1>'+
+  '<div class="card p-4 mb-4 grid gap-3">'+
+  '<select onchange="selMaterial=this.value||null;render()"><option value="">— Free topic —</option>'+materials.map(m=>'<option value="'+m.id+'" '+(selMaterial===m.id?'selected':'')+'>'+esc(m.title)+'</option>').join('')+'</select>'+
+  (!selMaterial?'<input placeholder="Topic, e.g. French verb tenses" value="'+esc(freeTopic)+'" oninput="freeTopic=this.value">':'')+
+  '<select onchange="flashCount=+this.value">'+[10,15,20].map(n=>'<option value="'+n+'" '+(flashCount===n?'selected':'')+'>'+n+' cards</option>').join('')+'</select>'+
+  '<button class="btn w-fit" '+(flashLoading?'disabled':'')+' onclick="generateFlash()">'+(flashLoading?'Generating…':'Generate flashcards')+'</button></div>'+
+  (flashErr?'<div class="card p-4 text-red-500 text-sm">'+flashErr+' <button class="btn-o text-xs ml-2" onclick="generateFlash()">Try again</button></div>':'');
+  const card=flashCards[flashIndex];
+  return '<div class="flex justify-between items-center mb-4"><h1 class="text-2xl font-bold">Flashcards</h1><span class="text-sm" style="color:var(--mut)">Card '+(flashIndex+1)+'/'+flashCards.length+'</span></div>'+
+  '<div style="perspective:1000px;height:220px" class="mb-4" onclick="flashFlip()">'+
+  '<div style="position:relative;width:100%;height:100%;transition:transform .5s;transform-style:preserve-3d;cursor:pointer;'+(flashFlipped?'transform:rotateY(180deg)':'')+'">'+
+  '<div class="card" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:1.5rem;text-align:center;backface-visibility:hidden;font-weight:600">'+esc(card.front)+'</div>'+
+  '<div class="card" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:1.5rem;text-align:center;backface-visibility:hidden;transform:rotateY(180deg)">'+esc(card.back)+'</div>'+
+  '</div></div>'+
+  '<p class="text-center text-xs mb-4" style="color:var(--mut)">Tap the card to flip'+(flashDifficult.has(flashIndex)?' · marked difficult':'')+'</p>'+
+  '<div class="flex flex-wrap gap-2 justify-center">'+
+  '<button class="btn-o" onclick="flashPrev()">← Prev</button>'+
+  '<button class="btn-o" onclick="flashToggleDifficult()">'+(flashDifficult.has(flashIndex)?'Unmark difficult':'Mark difficult')+'</button>'+
+  '<button class="btn-o" onclick="flashShuffle()">Shuffle</button>'+
+  '<button class="btn-o" onclick="flashNext()">Next →</button>'+
+  '<button class="btn" onclick="flashCards=null;render()">New set</button>'+
+  '</div>';
+}
+
+function esc(s){ return (s??'').toString().replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+init();
+</script>
+</body>
+</html>
