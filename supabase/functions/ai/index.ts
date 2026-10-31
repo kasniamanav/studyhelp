@@ -75,7 +75,7 @@ serve(async (req) => {
     const config: ProviderConfig = {
       provider: (Deno.env.get('AI_PROVIDER') as any) || 'gemini',
       apiKey: Deno.env.get('AI_API_KEY') || Deno.env.get('GEMINI_API_KEY') || '',
-      model: Deno.env.get('AI_MODEL') || 'gemini-1.5-flash',
+      model: Deno.env.get('AI_MODEL') || 'gemini-3.5-flash',
     };
 
     if (!config.apiKey) {

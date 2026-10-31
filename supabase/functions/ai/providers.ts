@@ -6,7 +6,7 @@ export interface ProviderConfig {
 
 export async function callLLMText(prompt: string, config: ProviderConfig, systemPrompt?: string): Promise<string> {
   if (config.provider === 'gemini') {
-    const model = config.model || 'gemini-1.5-flash';
+    const model = config.model || 'gemini-3.5-flash';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.apiKey}`;
     
     const contents: any[] = [];

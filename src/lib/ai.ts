@@ -53,8 +53,12 @@ async function directGeminiFallback(prompt: string, systemPrompt?: string): Prom
     err.code = 'sampling_disabled';
     throw err;
   }
-  const model = import.meta.env.AI_MODEL || 'gemini-1.5-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const candidateModels = [
+    import.meta.env.VITE_AI_MODEL || import.meta.env.AI_MODEL || 'gemini-3.5-flash',
+    'gemini-3-flash-preview',
+    'gemini-flash-latest',
+  ];
 
   const contents: any[] = [];
   if (systemPrompt) {
@@ -63,32 +67,50 @@ async function directGeminiFallback(prompt: string, systemPrompt?: string): Prom
   }
   contents.push({ role: 'user', parts: [{ text: prompt }] });
 
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents,
-      generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
-    }),
-  });
+  let lastError: any = null;
 
-  if (!resp.ok) {
-    const errorData = await resp.json().catch(() => null);
-    const msg = errorData?.error?.message || `API Error ${resp.status}`;
-    const err: any = new Error(msg);
-    if (resp.status === 429) err.code = 'rate_limited';
-    else if (resp.status === 403 || resp.status === 401) err.code = 'sampling_disabled';
-    throw err;
+  for (const model of candidateModels) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents,
+          generationConfig: { temperature: 0.3, maxOutputTokens: 4096 },
+        }),
+      });
+
+      if (!resp.ok) {
+        if (resp.status === 404 && model !== candidateModels[candidateModels.length - 1]) {
+          // Try next model if 404
+          continue;
+        }
+        const errorData = await resp.json().catch(() => null);
+        const msg = errorData?.error?.message || `API Error ${resp.status}`;
+        const err: any = new Error(msg);
+        if (resp.status === 429) err.code = 'rate_limited';
+        else if (resp.status === 403 || resp.status === 401) err.code = 'sampling_disabled';
+        throw err;
+      }
+
+      const data = await resp.json();
+      const text = data.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join('') || '';
+      if (!text.trim()) {
+        const err: any = new Error('Empty response');
+        err.code = 'empty_completion';
+        throw err;
+      }
+      return text;
+    } catch (e: any) {
+      lastError = e;
+      if (e.code === 'rate_limited' || e.code === 'sampling_disabled') {
+        throw e;
+      }
+    }
   }
 
-  const data = await resp.json();
-  const text = data.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join('') || '';
-  if (!text.trim()) {
-    const err: any = new Error('Empty response');
-    err.code = 'empty_completion';
-    throw err;
-  }
-  return text;
+  throw lastError || new Error('Could not connect to Gemini API');
 }
 
 export const ai = {
@@ -182,4 +204,3 @@ export const ai = {
     }
   },
 };
-
